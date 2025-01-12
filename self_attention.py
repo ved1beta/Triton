@@ -1,51 +1,46 @@
 import torch
-import torch.nn as nn
-import math
+import triton 
+import triton.language as tl
+DEVICE = "cuda"
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        return x
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim=None):
-        super().__init__()
-        hidden_dim = hidden_dim or dim * 4
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim)
-        )
+@triton.jit
+def add_kernal(x_ptr, y_ptr, output_ptr , n_elements , BLOCK_SIZE: tl.constexpr, ):
+    pid = tl.program_id(axis=0)
     
-    def forward(self, x):
-        return self.net(x)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start  + tl.arange(0, BLOCK_SIZE)
 
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.attn = MultiHeadAttention(dim, num_heads)
-        self.ff = FeedForward(dim)
-        
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ff(self.norm2(x))
-        return x
+    mask = offsets < n_elements
+    x = tl.load(x_ptr +offsets , mask=mask)
+
+    y = tl.load(y_ptr +offsets , mask=mask)
+
+    output = x + y
+    tl.store(output_ptr + offsets , output , mask=mask)
+
+def add(x:torch.Tensor , y : torch.Tensor ):
+    output = torch.empty_like(x)
+    n_elem = output.numel()
+
+    x = x.to(DEVICE)
+    y = y.to(DEVICE)
+    output = torch.empty_like(x, device=DEVICE)
+
+
+
+    grid = lambda meta : (triton.cdiv(n_elem, meta["BLOCK_SIZE"]),)
+
+    add_kernal[grid](x, y , output, n_elem, BLOCK_SIZE= 1024)
+    return output
+
+size = 98432
+x = torch.randn(size)
+y = torch.randn(size)
+
+output_torch = x+y
+output_triton = add(x, y)
+print(output_torch)
+
+print(output_triton)
+print(f'The maximum difference between torch and triton is '
+      f'{torch.max(torch.abs(output_torch - output_triton))}')
